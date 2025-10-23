@@ -17,7 +17,7 @@ queries = {
         FROM optionm_all.vsurfd2022
         WHERE secid IN (108105)
     """,
-    "secprc2022_spy": """
+    "secprc2022_spyx": """
         SELECT *
         FROM optionm_all.secprd2022
         WHERE secid IN (109820,108105)
