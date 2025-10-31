@@ -2,8 +2,8 @@ import pandas as pd
 import numpy as np
 
 
-VSURF_PATH = "volsrfc2022_spx.parquet"     
-SECPRC_PATH = "secprc2022_spyx.parquet"    
+VSURF_PATH = "data/raw/volsrfc2022_spx.parquet"     
+SECPRC_PATH = "data/raw/secprc2022_spyx.parquet"    
 
 vsurf = pd.read_parquet(VSURF_PATH)
 secprc = pd.read_parquet(SECPRC_PATH)
@@ -105,6 +105,7 @@ rs_var = (np.log(H / O) * np.log(H / C)) + (np.log(L / O) * np.log(L / C))
 
 window = 30
 annual_factor = 252 / window
+rs_var = pd.Series(rs_var, index=df.index)
 
 df["rv30_ann"] = annual_factor * rs_var.rolling(window).sum()
 
@@ -112,9 +113,35 @@ feat = feat.merge(df[["date", "rv30_ann"]], on="date", how="left")
 feat["ivvar_30d"] = feat["atm_iv_30d"] ** 2
 feat["vrp_30d"] = feat["ivvar_30d"] - feat["rv30_ann"]
 
-out_path = f"iv_features_spx_{D1}_{D30}_{D60}.parquet"  # e.g., iv_features_spx_10_30_60.parquet
+
+out_path = f"data/master/iv_features_spx_{D1}_{D30}_{D60}.parquet"  # e.g., iv_features_spx_10_30_60.parquet
 feat.reset_index().to_parquet(out_path, index=False)
+vix_feat = pd.read_csv("data/master/vix_all_2022.csv")
+vix_feat["date"] = pd.to_datetime(vix_feat["date"])
+close_cols = [c for c in vix_feat.columns if c.endswith("_close")]
+feat = feat.merge(vix_feat, on="date", how="left")
+
+for c in close_cols:
+    base = c[:-6]  # strip "_close"
+    lvl = feat[c]
+    feat[f"{base}_ret1"]  = np.log(lvl / lvl.shift(1))
+    feat[f"{base}_ma5"]   = lvl.rolling(5).mean()
+    feat[f"{base}_ma20"]  = lvl.rolling(20).mean()
+
+# VIX-based cross features if vix_close is present
+vix_sigma = feat["vix_close"] / 100.0                 # convert % to decimal
+feat["vix_var"] = vix_sigma ** 2
+
+feat["vrp_30d_vix"]   = feat["vix_var"] - feat["rv30_ann"]
+feat["ivrv_ratio_vix"] = feat["vix_var"] / feat["rv30_ann"]
+
+feat["vix_minus_atmiv30"]  = vix_sigma - feat["atm_iv_30d"]
+feat["atmiv_to_vix_ratio"] = feat["atm_iv_30d"] / vix_sigma
+
 
 print("Saved:", out_path)
 print("Columns:", feat.columns.tolist())
 print(feat.head(45))
+
+feat.to_csv("data/master/iv_features_spx_2022.csv", index=False)
+import pandas as pd
