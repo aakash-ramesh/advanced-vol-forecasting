@@ -109,7 +109,7 @@ rs_var = pd.Series(rs_var, index=df.index)
 
 df["rv30_ann"] = annual_factor * rs_var.rolling(window).sum()
 
-feat = feat.merge(df[["date", "rv30_ann"]], on="date", how="left")
+feat = feat.merge(df[["date", "rv30_ann"]], on="date", how="inner")
 feat["ivvar_30d"] = feat["atm_iv_30d"] ** 2
 feat["vrp_30d"] = feat["ivvar_30d"] - feat["rv30_ann"]
 
@@ -119,7 +119,7 @@ feat.reset_index().to_parquet(out_path, index=False)
 vix_feat = pd.read_csv("data/master/vix_all_2022.csv")
 vix_feat["date"] = pd.to_datetime(vix_feat["date"])
 close_cols = [c for c in vix_feat.columns if c.endswith("_close")]
-feat = feat.merge(vix_feat, on="date", how="left")
+feat = feat.merge(vix_feat, on="date", how="inner")
 
 for c in close_cols:
     base = c[:-6]  # strip "_close"
@@ -138,6 +138,7 @@ feat["ivrv_ratio_vix"] = feat["vix_var"] / feat["rv30_ann"]
 feat["vix_minus_atmiv30"]  = vix_sigma - feat["atm_iv_30d"]
 feat["atmiv_to_vix_ratio"] = feat["atm_iv_30d"] / vix_sigma
 
+feat = feat.drop_duplicates(subset=["date"], keep="last")
 
 print("Saved:", out_path)
 print("Columns:", feat.columns.tolist())
