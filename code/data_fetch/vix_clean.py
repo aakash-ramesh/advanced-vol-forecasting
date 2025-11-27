@@ -1,5 +1,8 @@
 import pandas as pd
 import numpy as np
+import os
+
+parent_dir = os.path.dirname(os.getcwd())+"/advanced-vol-forecasting/data/raw/"
 
 VIX_CSV  = "VIX_History.csv"   # update if paths differ on your machine
 VVIX_CSV = "VVIX_History.csv"
@@ -71,15 +74,15 @@ def _load_vix_like(path, prefix):
     return y
 
 # Load
-vix  = _load_vix_like(VIX_CSV,  prefix="vix")
-vix_9d = _load_vix_like(VIX_CSV,  prefix="vix9d")
+vix  = _load_vix_like(parent_dir+VIX_CSV,  prefix="vix")
+vix_9d = _load_vix_like(parent_dir+VIX9_CSV,  prefix="vix9d")
 # vvix = _load_vix_like(VVIX_CSV, prefix="vvix")
 
 # vvix = pd.read_csv(VVIX_CSV,header=None, names=['date', 'vvix'])
 # vvix['date'] = pd.to_datetime(vvix['date'])
 
 # Robust VVIX load -> columns: date, vvix
-_raw = pd.read_csv(VVIX_CSV)
+_raw = pd.read_csv(parent_dir+VVIX_CSV)
 _raw = _norm_cols(_raw)
 date_col = next((c for c in _raw.columns if "date" in c), _raw.columns[0])
 _raw["date"] = pd.to_datetime(_raw[date_col], errors="coerce")
@@ -104,4 +107,8 @@ vix_all = vix_all.sort_values("date").reset_index(drop=True)
 
 vix_all_2022 = vix_all[vix_all["date"].dt.year == 2022].reset_index(drop=True)
 
-vix_all_2022.to_csv("vix_all_2022.csv", index=False)
+vix_2000_2022 = vix_all[(vix_all["date"].dt.year >= 2000) & (vix_all["date"].dt.year <= 2022)].reset_index(drop=True)
+
+vix_2000_2022.to_csv(os.path.dirname(os.getcwd())+"/advanced-vol-forecasting/data/master/"+"vix_extended.csv", index=False)
+
+# vix_all_2022.to_csv("vix_all_2022.csv", index=False)
