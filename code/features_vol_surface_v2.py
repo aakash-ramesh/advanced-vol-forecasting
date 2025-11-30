@@ -2,166 +2,188 @@ import pandas as pd
 import numpy as np
 import os
 
-parent_dir = os.path.dirname(os.getcwd())+"/advanced-vol-forecasting/data/master/"
+# ==========================================
+# CONFIGURATION
+# ==========================================
+# Explicitly setting the base path to match your file structure
+project_root = "/Users/areya/Desktop/Project/advanced-vol-forecasting"
 
-# --- CONFIGURATION ---
-# Use the combined files generated in the previous step
-VSURF_PATH = parent_dir+"COMBINED_vsurfd_2000_2022.parquet"
-SECPRC_PATH = parent_dir+"COMBINED_secprd_2000_2022.parquet" # Assumes you combined secprc similarly, or use the raw file logic
-VIX_PATH = parent_dir+"vix_extended.csv" # Update this path if you have this file
+# Define Data Directories
+raw_dir = os.path.join(project_root, "data", "raw")
+master_dir = os.path.join(project_root, "data", "master")
 
-TARGET_SECID = 108105 # SPX (Index). Change to 109820 for SPY.
+# Input Paths
+VSURF_PATH = os.path.join(raw_dir, "COMBINED_vsurfd_2000_2022.parquet")
+SECPRC_PATH = os.path.join(raw_dir, "COMBINED_secprd_2000_2022.parquet")
+OPPRCD_PATH = os.path.join(raw_dir, "COMBINED_opprcd_2000_2022.parquet")
+VIX_PATH = os.path.join(raw_dir, "vix_extended.csv")
 
-print("Loading Data...")
-vsurf = pd.read_parquet(VSURF_PATH)
+# Output Path
+if not os.path.exists(master_dir):
+    os.makedirs(master_dir)
+OUT_CSV = os.path.join(master_dir, "iv_features_spx_2000_2022.csv")
+
+TARGET_SECID = 108105  # SPX Index
+
+print("--- Starting Feature Engineering Pipeline (Complete) ---")
+print(f"Data Source: {raw_dir}")
+
+# ==========================================
+# 1. PRICE DATA & REALIZED VOLATILITY (Rogers-Satchell)
+# ==========================================
+print("1. Calculating Rogers-Satchell Realized Volatility...")
+
+if not os.path.exists(SECPRC_PATH):
+    raise FileNotFoundError(f"Price file not found: {SECPRC_PATH}")
+
 secprc = pd.read_parquet(SECPRC_PATH)
-
-# --- 1. PREPROCESSING & FILTERING ---
-vsurf.columns = [c.lower() for c in vsurf.columns]
 secprc.columns = [c.lower() for c in secprc.columns]
-
-# FILTER: We must isolate the specific asset (SPX) from the combined file
-vsurf = vsurf[vsurf['secid'] == TARGET_SECID].copy()
 secprc = secprc[secprc['secid'] == TARGET_SECID].copy()
-
-vsurf["date"] = pd.to_datetime(vsurf["date"])
 secprc["date"] = pd.to_datetime(secprc["date"])
-
-print(f"Data Loaded. Processing {len(vsurf)} surface rows and {len(secprc)} price rows for SECID {TARGET_SECID}...")
-
-# Validation
-need = ["date","days","delta","impl_volatility"]
-missing = [c for c in need if c not in vsurf.columns]
-if missing:
-    raise ValueError(f"Missing columns in vsurf: {missing}")
-
-# --- 2. SURFACE PIVOT ---
-vsurf["days_round"] = vsurf["days"].round().astype(int)
-available_days = sorted(vsurf["days_round"].unique().tolist())
-
-# Helper to find nearest available maturity/delta
-def nearest(target, available):
-    return min(available, key=lambda x: abs(x - target))
-
-D1  = nearest(9, available_days)   
-D30 = nearest(30, available_days)  
-D60 = nearest(60, available_days) 
-all_deltas = sorted(vsurf["delta"].unique().tolist())
-
-print(f"Mapped Target Maturities: 9d->{D1}d, 30d->{D30}d, 60d->{D60}d")
-
-# Create the Master Grid (Date x [Days, Delta])
-iv_grid = vsurf.pivot_table(index="date",
-                            columns=["days_round","delta"],
-                            values="impl_volatility",
-                            aggfunc="mean").sort_index()
-
-# Helper to extract IV from grid safely
-def get_iv(days_target, delta_target):
-    d_actual = nearest(days_target, available_days)
-    x_actual = nearest(delta_target, all_deltas)
-    key = (d_actual, x_actual)
-    if key not in iv_grid.columns:
-        return pd.Series(index=iv_grid.index, dtype=float)
-    name = f"iv_d{d_actual}_d{int(x_actual)}"
-    return iv_grid[key].rename(name)
-
-def atm_iv(days_target):
-    c50 = get_iv(days_target, +50.0)
-    p50 = get_iv(days_target, -50.0)
-    # Average Call and Put ATM IV
-    if c50.notna().any() and p50.notna().any():
-        s = pd.concat([c50, p50], axis=1).mean(axis=1)
-    else:
-        s = c50 if c50.notna().any() else p50
-    s.name = f"atm_iv_{nearest(days_target, available_days)}d"
-    return s
-
-# --- 3. VOLATILITY FEATURES ---
-feat = pd.DataFrame(index=iv_grid.index)
-
-# Level
-feat[f"atm_iv_{D1}d"]  = atm_iv(D1)
-feat[f"atm_iv_{D30}d"] = atm_iv(D30)
-feat[f"atm_iv_{D60}d"] = atm_iv(D60)
-
-# Term Structure
-feat["term_slope"] = feat[f"atm_iv_{D30}d"] - feat[f"atm_iv_{D1}d"]
-feat["term_curv"] = feat[f"atm_iv_{D60}d"] - 2*feat[f"atm_iv_{D30}d"] + feat[f"atm_iv_{D1}d"]
-
-# Skew / Smile (Risk Reversal & Butterfly)
-put25  = get_iv(D30, -25.0)
-call25 = get_iv(D30, +25.0)
-call75 = get_iv(D30, +75.0)
-
-feat["rr_25d"] = put25 - call25
-mid_wings = pd.concat([put25, call25], axis=1).mean(axis=1)
-feat["bfly_25d"] = mid_wings - feat[f"atm_iv_{D30}d"]
-feat["smile_slope"] = call75 - feat[f"atm_iv_{D30}d"]
-
-# --- 4. REALIZED VOLATILITY ---
-# We use the already filtered 'secprc' dataframe
-df = secprc.sort_values("date").set_index("date")
-
-# Ensure floats
-O = df["open"].astype(float)
-H = df["high"].astype(float)
-L = df["low"].astype(float)
-C = df["close"].astype(float)
+secprc = secprc.sort_values("date").set_index("date")
+secprc = secprc[~secprc.index.duplicated(keep='last')]
 
 # Rogers-Satchell Variance
-rs_var = (np.log(H / O) * np.log(H / C)) + (np.log(L / O) * np.log(L / C))
+H, L, O, C = secprc["high"], secprc["low"], secprc["open"], secprc["close"]
+rs_term1 = np.log(H / C) * np.log(H / O)
+rs_term2 = np.log(L / C) * np.log(L / O)
+rs_var_daily = rs_term1 + rs_term2
 
-window = 30
-annual_factor = 252 / window
-rs_var = pd.Series(rs_var, index=df.index)
+# 30-Day Rolling Annualized RV
+rv_30d = np.sqrt(rs_var_daily.rolling(window=21).mean() * 252)
 
-# Calculate Rolling RV
-rv_series = annual_factor * rs_var.rolling(window).sum()
-feat = feat.join(rv_series.rename("rv30_ann"), how="inner")
+# Initialize Master DataFrame
+feat = pd.DataFrame(index=secprc.index)
+feat["rv30_ann"] = rv_30d
 
-# Variance Risk Premium
-feat["ivvar_30d"] = feat["atm_iv_30d"] ** 2
-feat["vrp_30d"] = feat["ivvar_30d"] - feat["rv30_ann"]
+# Target: Next Day's RV (Square root of annualized daily RS var)
+feat["target_rv_next_day"] = np.sqrt(rs_var_daily.shift(-1) * 252)
 
-# --- 5. OPTIONAL: VIX FEATURES ---
-# This block handles the case where you might not have the 2000-2022 VIX file yet
-if os.path.exists(VIX_PATH):
-    print(f"Merging VIX data from {VIX_PATH}...")
-    vix_feat = pd.read_csv(VIX_PATH)
-    vix_feat["date"] = pd.to_datetime(vix_feat["date"])
+# ==========================================
+# 2. IV SURFACE FEATURES (Slope, Curvature, Skew)
+# ==========================================
+print("2. Constructing IV Surface Features...")
+
+if not os.path.exists(VSURF_PATH):
+    raise FileNotFoundError(f"Surface file not found: {VSURF_PATH}")
+
+vsurf = pd.read_parquet(VSURF_PATH)
+vsurf.columns = [c.lower() for c in vsurf.columns]
+vsurf = vsurf[vsurf['secid'] == TARGET_SECID].copy()
+vsurf["date"] = pd.to_datetime(vsurf["date"])
+vsurf["days_round"] = vsurf["days"].round().astype(int)
+
+# Create lookup grid: Date x (Days, Delta)
+iv_grid = vsurf.pivot_table(
+    index="date", columns=["days_round", "delta"], 
+    values="impl_volatility", aggfunc="mean"
+).sort_index()
+
+def get_iv(df_grid, d, x):
+    """Safely extract IV for specific day (d) and delta (x)"""
+    if (d, x) in df_grid.columns: return df_grid[(d, x)]
+    if (d, -x) in df_grid.columns: return df_grid[(d, -x)] # Handle negative delta notation
+    return pd.Series(np.nan, index=df_grid.index)
+
+# A. ATM Levels
+feat["iv_30d"] = get_iv(iv_grid, 30, 50)
+feat["iv_60d"] = get_iv(iv_grid, 60, 50)
+feat["iv_90d"] = get_iv(iv_grid, 91, 50)
+
+# Fill missing data (weekends/holidays)
+feat = feat.ffill()
+
+# B. Term Structure
+feat["term_slope"] = feat["iv_60d"] - feat["iv_30d"] # Contango/Backwardation
+feat["term_curvature"] = feat["iv_30d"] - 2*feat["iv_60d"] + feat["iv_90d"]
+
+# C. Skew (Risk Reversal Proxy at 30D)
+# IV(Put 25) - IV(Call 25)
+iv_put_25 = get_iv(iv_grid, 30, -25)
+iv_call_25 = get_iv(iv_grid, 30, 25)
+feat["skew_30d"] = iv_put_25 - iv_call_25
+
+# ==========================================
+# 3. OPTION FLOW FEATURES (Gamma, PC Ratio, Vega)
+# ==========================================
+print("3. Processing Option Flow Features (Heavy Compute)...")
+
+if os.path.exists(OPPRCD_PATH):
+    # Read specific columns to save memory
+    flow_cols = ["secid", "date", "cp_flag", "volume", "open_interest", "gamma", "vega"]
+    try:
+        flow = pd.read_parquet(OPPRCD_PATH, columns=flow_cols)
+    except:
+        flow = pd.read_parquet(OPPRCD_PATH)[flow_cols]
+
+    # Filter for SPX
+    flow = flow[flow["secid"] == TARGET_SECID].copy()
+    flow["date"] = pd.to_datetime(flow["date"])
     
-    # Merge
-    feat = feat.merge(vix_feat, on="date", how="inner")
+    # Aggregations
+    # 1. Put/Call Ratios
+    flow['is_put'] = flow['cp_flag'] == 'P'
+    flow['is_call'] = flow['cp_flag'] == 'C'
     
-    # Calculate Returns / MAs if columns exist
-    close_cols = [c for c in vix_feat.columns if c.endswith("_close")]
-    for c in close_cols:
-        base = c[:-6]
-        lvl = feat[c]
-        feat[f"{base}_ret1"]  = np.log(lvl / lvl.shift(1))
-        feat[f"{base}_ma5"]   = lvl.rolling(5).mean()
-        
-    # VIX-Specific Derived Features
-    if "vix_close" in feat.columns:
-        vix_sigma = feat["vix_close"] / 100.0
-        feat["vix_var"] = vix_sigma ** 2
-        feat["vrp_30d_vix"] = feat["vix_var"] - feat["rv30_ann"]
-        feat["ivrv_ratio_vix"] = feat["vix_var"] / feat["rv30_ann"]
-        feat["vix_minus_atmiv30"]  = vix_sigma - feat["atm_iv_30d"]
+    # Conditional sums for P/C ratio
+    put_vol = flow[flow['is_put']].groupby('date')['volume'].sum()
+    call_vol = flow[flow['is_call']].groupby('date')['volume'].sum()
+    feat['pc_ratio_vol'] = put_vol / (call_vol + 1)
+    
+    put_oi = flow[flow['is_put']].groupby('date')['open_interest'].sum()
+    call_oi = flow[flow['is_call']].groupby('date')['open_interest'].sum()
+    feat['pc_ratio_oi'] = put_oi / (call_oi + 1)
+
+    # 2. Net Gamma Exposure (GEX Proxy)
+    feat["net_gamma"] = flow.groupby("date").apply(lambda x: np.sum(x["gamma"] * x["open_interest"]))
+
+    # 3. Vega Flow (Smart Money Proxy)
+    feat["vega_flow"] = flow.groupby("date").apply(lambda x: np.sum(x["vega"] * x["volume"]))
+    
+    # Forward fill flow data
+    feat = feat.ffill()
+    print("   Flow features calculated.")
 else:
-    print("⚠️ VIX file not found. Skipping VIX-specific feature generation.")
+    print(f"   WARNING: Option Price file not found at {OPPRCD_PATH}. Flow features skipped.")
 
-# --- 6. CLEANUP & SAVE ---
-feat = feat.drop_duplicates(subset=["date"], keep="last")
-# out_parquet = f"iv_features_spx_2000_2022.parquet"
-out_csv = parent_dir+f"iv_features_spx_2000_2022.csv"
+# ==========================================
+# 4. VARIANCE RISK PREMIUM (VRP)
+# ==========================================
+print("4. Calculating VRP...")
+# VRP = IV^2 - RV^2
+feat["vrp_30d"] = (feat["iv_30d"]**2) - (feat["rv30_ann"]**2)
 
-# feat.to_parquet(out_parquet, index=False)
-feat.to_csv(out_csv, index=False)
+# ==========================================
+# 5. MACRO / VIX FEATURES
+# ==========================================
+print("5. Merging Macro/VIX Data...")
+if os.path.exists(VIX_PATH):
+    vix_df = pd.read_csv(VIX_PATH, parse_dates=["date"]).set_index("date")
+    feat = feat.join(vix_df[['vix_close']], how='left')
+    feat['vix_level'] = feat['vix_close'] / 100.0
+    feat['vix_ma5'] = feat['vix_level'].rolling(5).mean()
+    feat['vix_gap'] = feat['vix_level'] - feat['iv_30d'] # Spread between VIX and SPX IV
+else:
+    print(f"   WARNING: VIX file not found at {VIX_PATH}. Skipping VIX features.")
 
-print("\nProcessing Complete.")
-# print(f"Saved parquet to: {out_parquet}")
-print(f"Saved csv to:     {out_csv}")
-print(f"Final Shape:      {feat.shape}")
-print(feat[['date', 'atm_iv_30d', 'term_slope', 'rv30_ann', 'vrp_30d']].tail())
+# ==========================================
+# 6. HAR LAGS & CLEANUP
+# ==========================================
+print("6. Finalizing Dataset...")
+# HAR Components
+feat['rv_d'] = feat['rv30_ann']
+feat['rv_w'] = feat['rv30_ann'].rolling(5).mean()
+feat['rv_m'] = feat['rv30_ann'].rolling(22).mean()
+
+# Drop rows with any NaNs (Crucial fix for MissingDataError)
+initial_len = len(feat)
+feat.dropna(inplace=True)
+dropped = initial_len - len(feat)
+
+print(f"   Dropped {dropped} rows containing NaNs/Lags.")
+print(f"   Final Shape: {feat.shape}")
+
+# Final Save
+feat.to_csv(OUT_CSV)
+print(f"--- Feature Engineering Complete ---")
+print(f"Saved to: {OUT_CSV}")
