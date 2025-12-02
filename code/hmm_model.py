@@ -1,13 +1,16 @@
 import os
+import requests
 import joblib
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
+from pathlib import Path
 
 from hmmlearn.hmm import GaussianHMM
 from sklearn.preprocessing import StandardScaler
 
+os.environ["FRED_API_KEY"] = "0edd0176511cb5f2acbd2333dcbe28b1"
 
 @dataclass
 class HMMConfig:
@@ -204,3 +207,126 @@ class VolatilityHMM:
         obj.state_order_ = payload["state_order_"]
         obj.fitted_ = payload["fitted_"]
         return obj
+
+
+# =========================
+# Macro HMM (FRED) builder
+# =========================
+def fetch_fred_series(series_id: str, start: str, end: str, api_key: str) -> pd.Series:
+    """
+    Fetch a monthly FRED series and return a Series indexed by month-end.
+    """
+    url = "https://api.stlouisfed.org/fred/series/observations"
+    params = {
+        "series_id": series_id,
+        "api_key": api_key,
+        "file_type": "json",
+        "observation_start": start,
+        "observation_end": end,
+    }
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    data = r.json()["observations"]
+    df = pd.DataFrame(data)
+    df["value"] = pd.to_numeric(df["value"].replace(".", np.nan), errors="coerce")
+    df["date"] = pd.to_datetime(df["date"]) + pd.offsets.MonthEnd(0)
+    return df.set_index("date")["value"].rename(series_id)
+
+
+def build_macro_hmm(
+    start_date: str = "1970-01-01",
+    end_date: str = "2023-01-01",
+    n_states: int = 3,
+    random_state: int = 42,
+    output_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """
+    Fetch macro data from FRED, engineer spreads/growth, fit a Gaussian HMM,
+    and save regimes plus model artifacts.
+    """
+    api_key = os.getenv("FRED_API_KEY")
+    if not api_key:
+        raise RuntimeError("FRED_API_KEY not set in environment.")
+
+    series_ids = [
+        "GS10",      # 10Y Treasury
+        "TB3MS",     # 3M T-Bill
+        "BAA",       # Baa Corporate
+        "AAA",       # Aaa Corporate
+        "INDPRO",    # Industrial Production
+        "CPIAUCSL",  # CPI
+        "UNRATE",    # Unemployment
+        "USRECM",    # Recession indicator (for reference)
+    ]
+
+    print("Fetching FRED series...")
+    df_list = [fetch_fred_series(s, start_date, end_date, api_key) for s in series_ids]
+    df = pd.concat(df_list, axis=1).dropna(how="all").sort_index()
+
+    # Feature engineering (monthly)
+    df["TERM_SPREAD"] = df["GS10"] - df["TB3MS"]
+    df["CREDIT_SPREAD"] = df["BAA"] - df["AAA"]
+    df["INDPRO_YoY"] = pd.Series(np.log(df["INDPRO"])).diff(12) * 100
+    df["CPI_YoY"] = pd.Series(np.log(df["CPIAUCSL"])).diff(12) * 100
+    df["UNRATE_Delta"] = df["UNRATE"].diff(6)
+
+    features = ["TERM_SPREAD", "CREDIT_SPREAD", "INDPRO_YoY", "CPI_YoY", "UNRATE_Delta"]
+    df_model = df[features].dropna()
+
+    X = df_model.values
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    print("Training macro HMM...")
+    model = GaussianHMM(
+        n_components=n_states,
+        covariance_type="full",
+        n_iter=1000,
+        random_state=random_state,
+    )
+    model.fit(X_scaled)
+
+    # Order states by CREDIT_SPREAD (low -> high risk)
+    credit_idx = features.index("CREDIT_SPREAD")
+    state_means = model.means_[:, credit_idx]
+    order = np.argsort(state_means)
+    mapping = {raw: ordered for ordered, raw in enumerate(order)}
+
+    hidden_raw = model.predict(X_scaled)
+    hidden_sorted = np.array([mapping[s] for s in hidden_raw])
+    probs_raw = model.predict_proba(X_scaled)
+    probs_sorted = probs_raw[:, order]
+
+    out = df_model.copy()
+    out["hmm_state"] = hidden_sorted
+    for k in range(n_states):
+        out[f"prob_state_{k}"] = probs_sorted[:, k]
+
+    # Save artifacts
+    project_root = Path(__file__).resolve().parents[1]
+    out_dir = output_dir or project_root / "data" / "master"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    csv_path = out_dir / "hmm_macro_regimes_monthly.csv"
+    model_path = out_dir / "hmm_model_trained.pkl"
+    scaler_path = out_dir / "hmm_scaler.pkl"
+
+    out.to_csv(csv_path)
+    joblib.dump(model, model_path)
+    joblib.dump(scaler, scaler_path)
+
+    print(f"Saved regimes to {csv_path}")
+    print(f"Saved model to   {model_path}")
+    print(f"Saved scaler to  {scaler_path}")
+
+    return {
+        "data": out,
+        "model": model,
+        "scaler": scaler,
+        "state_order": order,
+    }
+
+
+if __name__ == "__main__":
+    # Build macro HMM using FRED data and save outputs
+    build_macro_hmm()
